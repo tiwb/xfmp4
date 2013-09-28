@@ -1,4 +1,4 @@
-#include <mp4v2/mp4v2.h>
+#include <mp4v2/mp4.h>
 #include <faac.h>
 
 extern "C" {
@@ -7,10 +7,7 @@ extern "C" {
 }
 
 #include <Windows.h>
-#include <Shlwapi.h>
 #include <math.h>
-
-#pragma comment(lib, "shlwapi.lib")
 
 static void show_error(const char *msg) {
   fprintf(stderr, "%s\n", msg);
@@ -251,7 +248,6 @@ int mp4_convert(mp4_convert_param_t *convert_args, const char* filename) {
     uint32_t total_samples = 0;
     uint32_t encoded_samples = 0;
     uint32_t progress = 0;
-    uint32_t finish_wait = frame_size * 100;
 
     double total_time = 0;
     double capture_time = 0;
@@ -260,6 +256,10 @@ int mp4_convert(mp4_convert_param_t *convert_args, const char* filename) {
     for (;; ) {
       float *input_position = input_buffer + input_samples * input_buffer_id;
       input_buffer_id = (input_buffer_id + 1) % input_buffer_count;
+
+      if (convert_args->video_input == INVALID_HANDLE_VALUE && 
+        convert_args->audio_input == INVALID_HANDLE_VALUE)
+        break;
 
       // generate frame data
       for (int samples_left = frame_size; samples_left; ) {
@@ -270,11 +270,12 @@ int mp4_convert(mp4_convert_param_t *convert_args, const char* filename) {
 
         // clear data
         short temp_buffer[32 * 2];
-        memset(input_position, 0, sizeof(temp_buffer));
+        memset(temp_buffer, 0, sizeof(temp_buffer));
 
         // read audio data
         if (convert_args->audio_input != INVALID_HANDLE_VALUE) {
-          BOOL success = ReadFile(convert_args->video_input, input_position, samples * sizeof(short), NULL, NULL);
+          DWORD read_size = 0;
+          BOOL success = ReadFile(convert_args->audio_input, temp_buffer, samples * 2 * sizeof(short), &read_size, NULL);
           if (!success) {
             CloseHandle(convert_args->audio_input);
             convert_args->audio_input = INVALID_HANDLE_VALUE;
@@ -283,18 +284,13 @@ int mp4_convert(mp4_convert_param_t *convert_args, const char* filename) {
 
         // convert audio data to float
         for (int i = 0; i < samples; i++) {
-          input_position[0] = temp_buffer[i + 2 + 0] * 32767.0f;
-          input_position[1] = temp_buffer[i * 2 + 1] * 32767.0f;
+          input_position[0] = temp_buffer[i * 2 + 0];
+          input_position[1] = temp_buffer[i * 2 + 1];
           input_position += 2;
         }
 
         total_time += delta_time;
         if (total_time > capture_time) {
-          x264_nal_t *nal;
-          int i_nal;
-          int i_frame_size;
-          x264_picture_t pic_out;
-
           // capture image from display
           int width = param.i_width;
           int height = param.i_height;
@@ -304,7 +300,8 @@ int mp4_convert(mp4_convert_param_t *convert_args, const char* filename) {
 
           // read video data
           if (convert_args->video_input != INVALID_HANDLE_VALUE) {
-            BOOL success = ReadFile(convert_args->video_input, data, size, NULL, NULL);
+            DWORD read_size = 0;
+            BOOL success = ReadFile(convert_args->video_input, data, size, &read_size, NULL);
             if (!success) {
               CloseHandle(convert_args->video_input);
               convert_args->video_input = INVALID_HANDLE_VALUE;
@@ -324,12 +321,12 @@ int mp4_convert(mp4_convert_param_t *convert_args, const char* filename) {
               rgbtoy(rgb[0], rgb[1], rgb[2], yline[0]); sr += rgb[0]; sg += rgb[1]; sb += rgb[2];
               rgb += pitch; yline += picture.img.i_stride[0];
               rgbtoy(rgb[0], rgb[1], rgb[2], yline[0]); sr += rgb[0]; sg += rgb[1]; sb += rgb[2];
-              rgb += 4; yline++;
+              rgb += 3; yline++;
               rgbtoy(rgb[0], rgb[1], rgb[2], yline[0]); sr += rgb[0]; sg += rgb[1]; sb += rgb[2];
               rgb -= pitch; yline -= picture.img.i_stride[0];
               rgbtoy(rgb[0], rgb[1], rgb[2], yline[0]); sr += rgb[0]; sg += rgb[1]; sb += rgb[2];
 
-              rgb += 4; yline++;
+              rgb += 3; yline++;
               sr /= 4; sg /= 4; sb /= 4;
               rgbtouv(sr, sg, sb, *uline, *vline);
               uline++;
@@ -340,6 +337,11 @@ int mp4_convert(mp4_convert_param_t *convert_args, const char* filename) {
           delete[] data;
 
           // encode image to H.264
+          x264_nal_t *nal;
+          int i_nal;
+          int i_frame_size;
+          x264_picture_t pic_out;
+
           i_frame_size = x264_encoder_encode(x264_encoder, &nal, &i_nal, &picture, &pic_out);
           picture.i_pts++;
 
@@ -391,18 +393,42 @@ int mp4_convert(mp4_convert_param_t *convert_args, const char* filename) {
 
         encoded_samples += dur;
       }
+    }
+  }
 
-      // export finished
-      if (convert_args->video_input == INVALID_HANDLE_VALUE && 
-        convert_args->audio_input == INVALID_HANDLE_VALUE)
-      {
-        if (finish_wait > frame_size) {
-          finish_wait -= frame_size;
+  //Flush delayed frames
+  while (x264_encoder_delayed_frames(x264_encoder))
+  {
+    x264_nal_t *nal;
+    int i_nal;
+    int i_frame_size;
+    x264_picture_t pic_out;
+
+    i_frame_size = x264_encoder_encode(x264_encoder, &nal, &i_nal, NULL, &pic_out);
+
+    if( i_frame_size < 0 ) {
+      break;
+    }
+    else if (i_frame_size) {
+      for (int nal_id = 0; nal_id < i_nal; ++nal_id) {
+        uint32_t size = nal[nal_id].i_payload;
+        uint8_t *nalu = nal[nal_id].p_payload;
+
+        nalu[0] = ((size - 4) >> 24) & 0xff;
+        nalu[1] = ((size - 4) >> 16) & 0xff;
+        nalu[2] = ((size - 4) >> 8) & 0xff;
+        nalu[3] = ((size - 4) >> 0) & 0xff;
+
+        // write samples
+        MP4Duration dur = mp4_time_scale / frames_per_sec;
+        if (!MP4WriteSample(file, video_track, nalu, size, dur, 0, pic_out.b_keyframe != 0)) {
+          show_error("Encode mp4 error.");
+          goto done;
         }
-        else {
-          result = 0;
-          break;
-        }
+
+        bool slice_is_idr = nal[nal_id].i_type == 5;
+        dpb_add(&h264_dpb, pic_out.i_pts, slice_is_idr);
+        frame_count++;
       }
     }
   }
@@ -433,11 +459,13 @@ done:
 
 static void show_usage() {
   char buff[MAX_PATH];
-  GetModuleFileName(NULL, buff, sizeof(buff));
+  GetModuleFileNameA(NULL, buff, sizeof(buff));
+  char *filename = strrchr(buff, '\\');
+  if (filename == NULL) filename = buff;
   fprintf(stderr, "Raw to x264-faac-mp4 encoder.\n");
   fprintf(stderr, "  this free program converts raw video input (in RGB format)"
                   "  and audio input (in 16 bit PCM format) to a MP4 file.\n\n");
-  fprintf(stderr, "Usage: %s flags\n", PathFindFileName(buff));
+  fprintf(stderr, "Usage: %s flags\n", filename);
   fprintf(stderr, "  --video_input video_filename\n");
   fprintf(stderr, "  --video_width width\n");
   fprintf(stderr, "  --video_height height\n");
@@ -448,10 +476,14 @@ static void show_usage() {
 }
 
 int main(int argc, char* argv[]) {
+  // hack to wait pipe ready
+  Sleep(100);
+
   if (argc < 2) {
     show_usage();
     return 0;
   }
+
 
   int result = 1;
   const char* output_filename = NULL;
@@ -583,6 +615,11 @@ int main(int argc, char* argv[]) {
     fprintf(stderr, "No output filename");
     goto cleanup;
   }
+  
+#if 0
+  char utf8_filename[512];
+  ::WideCharToMultiByte(CP_UTF8, 0, output_filename, -1, utf8_filename, sizeof(utf8_filename), NULL, NULL);
+#endif
 
   // do convertion
   result = mp4_convert(&param, output_filename);
